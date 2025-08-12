@@ -1,0 +1,228 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'IDP Solution using Amazon Bedrock and Anthropic Claude'
+Transform: AWS::Serverless-2016-10-31
+
+Parameters:
+  BucketName:
+    Type: String
+    Description: Name for the S3 bucket (must be globally unique)
+  ModelId:
+    Type: String
+    Description: Model ID from Bedrock
+    Default: 'anthropic.claude-3-sonnet-20240229-v1:0'
+    AllowedValues:
+      - ai21.jamba-1-5-large-v1:0
+      - ai21.jamba-1-5-mini-v1:0
+      - amazon.nova-canvas-v1:0
+      - amazon.nova-lite-v1:0
+      - amazon.nova-micro-v1:0
+      - amazon.nova-premier-v1:0
+      - amazon.nova-pro-v1:0
+      - anthropic.claude-3-haiku-20240307-v1:0
+      - anthropic.claude-3-opus-20240229-v1:0
+      - anthropic.claude-3-sonnet-20240229-v1:0
+      - anthropic.claude-3-5-haiku-20241022-v1:0
+      - anthropic.claude-3-5-sonnet-20241022-v2:0
+      - anthropic.claude-3-5-sonnet-20240620-v1:0
+      - anthropic.claude-3-7-sonnet-20250219-v1:0
+      - deepseek.r1-v1:0
+      - luma.ray-v2:0
+      - meta.llama3-8b-instruct-v1:0
+      - meta.llama3-70b-instruct-v1:0
+      - meta.llama3-1-8b-instruct-v1:0
+      - meta.llama3-1-70b-instruct-v1:0
+      - meta.llama3-1-405b-instruct-v1:0
+      - meta.llama3-2-1b-instruct-v1:0
+      - meta.llama3-2-3b-instruct-v1:0
+      - meta.llama3-2-11b-instruct-v1:0
+      - meta.llama3-2-90b-instruct-v1:0
+      - meta.llama3-3-70b-instruct-v1:0
+      - meta.llama4-maverick-17b-instruct-v1:0
+      - meta.llama4-scout-17b-instruct-v1:0
+      - mistral.mistral-7b-instruct-v0:2
+      - mistral.mistral-large-2402-v1:0
+      - mistral.mistral-large-2407-v1:0
+      - mistral.mistral-small-2402-v1:0
+      - mistral.mixtral-8x7b-instruct-v0:1
+      - mistral.pixtral-large-2502-v1:0
+      - stability.sd3-5-large-v1:0
+      - stability.stable-image-core-v1:1
+      - stability.stable-image-ultra-v1:1
+Resources:
+  # S3 Bucket
+  DocumentBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref BucketName
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+    DeletionPolicy: Delete
+      
+  # SQS Queue
+  ExtractedDataQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: bedrock-idp-extracted-data
+      KmsMasterKeyId: alias/aws/sqs
+      VisibilityTimeout: 60
+
+  # DynamoDB Tables
+  BirthCertificatesTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+        KMSMasterKeyId: alias/aws/dynamodb     
+      AttributeDefinitions:
+        - AttributeName: Id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: Id
+          KeyType: HASH
+      BillingMode: PAY_PER_REQUEST
+
+  # Lambda Function - Bedrock Invoker
+  InvokeBedrockFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: invoke_bedrock_claude3
+      Runtime: python3.12
+      Handler: invoke_bedrock_claude3.lambda_handler
+      Role: !GetAtt InvokeBedrockRole.Arn
+      CodeUri: ./lambda/bedrock_invoker/
+      Timeout: 120
+      Events:
+        UploadImage:
+          Type: S3
+          Properties:
+            Bucket: !Ref DocumentBucket
+            Events: s3:ObjectCreated:*
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: 'birth_certificates/images/'
+      Environment:
+        Variables:
+          QUEUE_URL: !Ref ExtractedDataQueue
+          MODEL_ID: !Ref ModelId
+          DYNAMODB_TABLE: !Ref BirthCertificatesTable
+
+  # Lambda Function - DynamoDB Inserter
+  InsertDynamoDBFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: insert_into_dynamodb
+      Runtime: python3.12
+      Handler: insert_into_dynamodb.lambda_handler
+      Role: !GetAtt InsertDynamoDBRole.Arn
+      CodeUri: ./lambda/dynamodb_inserter/
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref BirthCertificatesTable
+      Timeout: 60
+
+  # IAM Role for Bedrock Invoker Lambda
+  InvokeBedrockRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: invoke-bedrock-claude3-policy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: bedrock:InvokeModel
+                Resource: !Sub arn:aws:bedrock:${AWS::Region}::foundation-model/*
+              - Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub arn:aws:s3:::${BucketName}/*
+              - Effect: Allow
+                Action: sqs:SendMessage
+                Resource: !GetAtt ExtractedDataQueue.Arn
+              - Effect: Allow
+                Action: dynamodb:PutItem
+                Resource: !GetAtt BirthCertificatesTable.Arn
+
+  # IAM Role for DynamoDB Inserter Lambda
+  InsertDynamoDBRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: insert-dynamodb-policy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: dynamodb:PutItem
+                Resource: 
+                  - !GetAtt BirthCertificatesTable.Arn
+              - Effect: Allow
+                Action:
+                  - sqs:DeleteMessage
+                  - sqs:ReceiveMessage
+                  - sqs:GetQueueAttributes
+                Resource: !GetAtt ExtractedDataQueue.Arn
+
+  # S3 Event Notification Permission
+  S3InvokeLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref InvokeBedrockFunction
+      Principal: s3.amazonaws.com
+      SourceArn: !GetAtt DocumentBucket.Arn
+
+  # SQS Event Source Mapping
+  SQSEventSourceMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !GetAtt ExtractedDataQueue.Arn
+      FunctionName: !Ref InsertDynamoDBFunction
+      Enabled: true
+
+Outputs:
+  BucketName:
+    Description: Name of the created S3 bucket
+    Value: !Ref DocumentBucket
+  QueueURL:
+    Description: URL of the SQS queue
+    Value: !Ref ExtractedDataQueue
+  DynamoDBTableName:
+    Description: Name of the DynamoDB table
+    Value: !Ref BirthCertificatesTable
+
+
+
+
+
+
+

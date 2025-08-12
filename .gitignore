@@ -1,0 +1,9 @@
+# AWS SAM
+.aws-sam/
+**/*.DS_Store
+
+# Ignore Terraform Files
+*.tfstate*
+.terraform.lock.hcl
+.terraform/**
+lambda/*.zip
