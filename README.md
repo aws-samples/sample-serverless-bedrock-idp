@@ -37,7 +37,7 @@ idp-genai/
 1. Clone the repository:
 ```bash
 git clone <repository-url>
-cd idp-genai
+cd sample-serverless-bedrock-idp
 ```
 #### Terraform
 1. Make sure your AWS credentials are properly configured on the CLI
